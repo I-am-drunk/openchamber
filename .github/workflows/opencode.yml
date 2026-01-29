@@ -72,7 +72,6 @@ jobs:
         run: |
           npm install -g opencode-ai @openchamber/web
           sudo apt update && sudo apt install jq lsof coreutils openssl -y
-
           # Install ttyd for OpenCode TTY exposure
           wget -q -O ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.3/ttyd.x86_64
           chmod +x ttyd
@@ -97,14 +96,10 @@ jobs:
           TTYD_ARGS=""
           if [[ -n "$OPENCODE_SERVER_PASSWORD" ]]; then
             echo "Password protection enabled."
-            # Export for subsequent steps (Monitor script) and other services
             echo "OPENCHAMBER_UI_PASSWORD=$OPENCODE_SERVER_PASSWORD" >> $GITHUB_ENV
             echo "OPENCODE_UI_PASSWORD=$OPENCODE_SERVER_PASSWORD" >> $GITHUB_ENV
-
-            # Use for current step
             export OPENCHAMBER_UI_PASSWORD="$OPENCODE_SERVER_PASSWORD"
             export OPENCODE_UI_PASSWORD="$OPENCODE_SERVER_PASSWORD"
-
             TTYD_ARGS="-c user:$OPENCODE_SERVER_PASSWORD"
           else
             echo "Password protection disabled (OPENCODE_SERVER_PASSWORD not set)."
@@ -132,71 +127,180 @@ jobs:
 
           # Wait for services to initialize
           sleep 20
-
           echo "Services started. Checking status..."
           lsof -i :7681 || echo "Warning: OpenCode TTY may not be running"
           lsof -i :9090 || echo "Warning: OpenChamber may not be running"
           lsof -i :8080 || echo "Warning: OpenCode Web may not be running"
 
-      - name: Setup Tunnel
+      - name: Setup Pooled Tunnel
         run: |
           if [[ "${{ github.event.inputs.tunnel_provider }}" == "ngrok" ]]; then
-            echo "Setting up ngrok tunnel..."
+            echo "Setting up ngrok pooled tunnels..."
             curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
             echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
             sudo apt update && sudo apt install ngrok -y
-            ngrok config add-authtoken "${{ secrets.NGROK_AUTH_TOKEN }}"
 
-            # Note: Multiple ngrok tunnels on free plan might be limited or require config file
-            # Attempting to start tunnels blindly
-            nohup ngrok http 127.0.0.1:9090 --log=stdout > tunnel_chamber.log 2>&1 &
-            nohup ngrok http 127.0.0.1:8080 --log=stdout > tunnel_web.log 2>&1 &
-            nohup ngrok http 127.0.0.1:7681 --log=stdout > tunnel_tty.log 2>&1 &
-            sleep 10
+            # Create pooled ngrok config with all tunnels
+            mkdir -p ~/.config/ngrok
+            cat > ~/.config/ngrok/ngrok.yml << EOF
+          version: "2"
+          authtoken: ${{ secrets.NGROK_AUTH_TOKEN }}
+          tunnels:
+            tty:
+              addr: 7681
+              proto: http
+              inspect: false
+            chamber:
+              addr: 9090
+              proto: http
+              inspect: false
+            web:
+              addr: 8080
+              proto: http
+              inspect: false
+          EOF
 
-            # Extract URLs
-            URL_CHAMBER=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.config.addr | contains("9090")) | .public_url' || true)
-            URL_WEB=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.config.addr | contains("8080")) | .public_url' || true)
-            URL_TTY=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.config.addr | contains("7681")) | .public_url' || true)
+            # Start all tunnels from single pooled config
+            echo "Starting ngrok tunnel pool..."
+            nohup ngrok start --all --log=stdout > tunnel_pool.log 2>&1 &
 
-            echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
-            echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
-            echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
-
-          else
-            echo "Setting up Cloudflare tunnel..."
-            wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-            sudo dpkg -i cloudflared-linux-amd64.deb
-
-            # Start 3 separate tunnels
-            nohup cloudflared tunnel --url http://127.0.0.1:7681 > tunnel_tty.log 2>&1 &
-            nohup cloudflared tunnel --url http://127.0.0.1:9090 > tunnel_chamber.log 2>&1 &
-            nohup cloudflared tunnel --url http://127.0.0.1:8080 > tunnel_web.log 2>&1 &
-
-            echo "Waiting for Cloudflare Tunnel URLs..."
-
-            # Loop to wait for URLs
+            # Wait for tunnel pool to initialize
+            echo "Waiting for ngrok tunnel pool..."
             for i in {1..30}; do
-              URL_TTY=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel_tty.log 2>/dev/null | tail -n 1 || true)
-              URL_CHAMBER=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel_chamber.log 2>/dev/null | tail -n 1 || true)
-              URL_WEB=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel_web.log 2>/dev/null | tail -n 1 || true)
-
-              if [[ -n "$URL_TTY" && -n "$URL_CHAMBER" && -n "$URL_WEB" ]]; then
-                echo "All tunnels established!"
-                break
+              TUNNELS_JSON=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null || true)
+              if [[ -n "$TUNNELS_JSON" ]]; then
+                TUNNEL_COUNT=$(echo "$TUNNELS_JSON" | jq '.tunnels | length' 2>/dev/null || echo "0")
+                if [[ "$TUNNEL_COUNT" -ge 3 ]]; then
+                  echo "All tunnels in pool established!"
+                  break
+                fi
               fi
-              echo "Waiting for tunnels... ($i/30)"
+              echo "Waiting for tunnel pool... ($i/30) - Found: ${TUNNEL_COUNT:-0} tunnels"
               sleep 2
             done
 
-            if [[ -z "$URL_TTY" ]]; then echo "Warning: TTY Tunnel URL missing"; fi
-            if [[ -z "$URL_CHAMBER" ]]; then echo "Warning: Chamber Tunnel URL missing"; fi
-            if [[ -z "$URL_WEB" ]]; then echo "Warning: Web Tunnel URL missing"; fi
+            # Extract URLs from pool
+            URL_TTY=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "tty") | .public_url' || true)
+            URL_CHAMBER=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "chamber") | .public_url' || true)
+            URL_WEB=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "web") | .public_url' || true)
+
+            echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
+            echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
+            echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
+
+          else
+            echo "Setting up Cloudflare pooled tunnels..."
+            wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+            sudo dpkg -i cloudflared-linux-amd64.deb
+
+            # Create pooled Cloudflare config with ingress rules
+            mkdir -p ~/.cloudflared
+            cat > ~/.cloudflared/config.yml << EOF
+          tunnel: openchamber-pool
+          credentials-file: ~/.cloudflared/credentials.json
+          ingress:
+            - hostname: tty.openchamber.local
+              service: http://127.0.0.1:7681
+            - hostname: chamber.openchamber.local
+              service: http://127.0.0.1:9090
+            - hostname: web.openchamber.local
+              service: http://127.0.0.1:8080
+            - service: http_status:404
+          EOF
+
+            # For quick tunnels (no account needed), start pooled processes with supervisor
+            echo "Starting Cloudflare tunnel pool..."
+            
+            # Create tunnel pool manager script
+            cat > /tmp/cf_pool_manager.sh << 'POOLSCRIPT'
+          #!/bin/bash
+          declare -A TUNNEL_PIDS
+          declare -A TUNNEL_URLS
+
+          start_tunnel() {
+            local name=$1
+            local port=$2
+            local logfile="/tmp/tunnel_${name}.log"
+            
+            cloudflared tunnel --url "http://127.0.0.1:${port}" > "$logfile" 2>&1 &
+            TUNNEL_PIDS[$name]=$!
+            echo "Started tunnel $name (PID: ${TUNNEL_PIDS[$name]})"
+          }
+
+          # Start all tunnels in pool
+          start_tunnel "tty" 7681
+          start_tunnel "chamber" 9090
+          start_tunnel "web" 8080
+
+          # Wait and collect URLs
+          echo "Collecting tunnel URLs from pool..."
+          for i in {1..30}; do
+            for name in tty chamber web; do
+              if [[ -z "${TUNNEL_URLS[$name]}" ]]; then
+                url=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' "/tmp/tunnel_${name}.log" 2>/dev/null | tail -n 1 || true)
+                if [[ -n "$url" ]]; then
+                  TUNNEL_URLS[$name]=$url
+                  echo "URL_${name^^}=$url"
+                fi
+              fi
+            done
+            
+            # Check if all URLs collected
+            if [[ -n "${TUNNEL_URLS[tty]}" && -n "${TUNNEL_URLS[chamber]}" && -n "${TUNNEL_URLS[web]}" ]]; then
+              echo "POOL_READY=true"
+              break
+            fi
+            sleep 2
+          done
+
+          # Output final URLs
+          echo "URL_TTY=${TUNNEL_URLS[tty]}"
+          echo "URL_CHAMBER=${TUNNEL_URLS[chamber]}"
+          echo "URL_WEB=${TUNNEL_URLS[web]}"
+
+          # Keep pool alive
+          wait
+          POOLSCRIPT
+            chmod +x /tmp/cf_pool_manager.sh
+
+            # Run pool manager in background and capture output
+            /tmp/cf_pool_manager.sh > /tmp/pool_output.log 2>&1 &
+            POOL_PID=$!
+
+            # Wait for pool to be ready
+            echo "Waiting for Cloudflare tunnel pool..."
+            for i in {1..60}; do
+              if grep -q "POOL_READY=true" /tmp/pool_output.log 2>/dev/null; then
+                echo "Tunnel pool is ready!"
+                break
+              fi
+              echo "Waiting for pool... ($i/60)"
+              sleep 2
+            done
+
+            # Extract URLs from pool output
+            URL_TTY=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' /tmp/tunnel_tty.log 2>/dev/null | tail -n 1 || true)
+            URL_CHAMBER=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' /tmp/tunnel_chamber.log 2>/dev/null | tail -n 1 || true)
+            URL_WEB=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' /tmp/tunnel_web.log 2>/dev/null | tail -n 1 || true)
+
+            if [[ -z "$URL_TTY" ]]; then echo "Warning: TTY Tunnel URL missing from pool"; fi
+            if [[ -z "$URL_CHAMBER" ]]; then echo "Warning: Chamber Tunnel URL missing from pool"; fi
+            if [[ -z "$URL_WEB" ]]; then echo "Warning: Web Tunnel URL missing from pool"; fi
 
             echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
             echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
             echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
           fi
+
+          # Display pool status
+          echo ""
+          echo "============================================"
+          echo "       TUNNEL POOL STATUS"
+          echo "============================================"
+          echo "TTY URL:     $URL_TTY"
+          echo "Chamber URL: $URL_CHAMBER"
+          echo "Web URL:     $URL_WEB"
+          echo "============================================"
 
       # ============================================================
       # MONITOR: Self-healing loop with status updates
@@ -206,7 +310,6 @@ jobs:
           OPENCHAMBER_UI_PASSWORD: ${{ env.OPENCODE_SERVER_PASSWORD }}
         run: |
           chmod +x scripts/monitor.sh
-          # Pass all 3 URLs to monitor script
           ./scripts/monitor.sh "${{ github.event.inputs.tunnel_provider }}" "${{ github.event.inputs.timeout_minutes }}" "${{ env.URL_TTY }}" "${{ env.URL_CHAMBER }}" "${{ env.URL_WEB }}"
 
       # ============================================================
