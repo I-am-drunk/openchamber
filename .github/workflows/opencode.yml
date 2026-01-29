@@ -3,6 +3,15 @@ name: OpenChamber for Actions
 on:
   workflow_dispatch:
     inputs:
+      service_mode:
+        description: 'Select Service to Launch'
+        required: true
+        default: 'openchamber'
+        type: choice
+        options:
+          - openchamber
+          - opencode
+          - both
       tunnel_provider:
         description: 'Select Tunnel Provider'
         required: true
@@ -86,11 +95,12 @@ jobs:
           RESTORE_DIR=/tmp/opencode-restore ./scripts/opencode-config.sh
 
       # ============================================================
-      # STARTUP: Launch services and tunnel
+      # STARTUP: Launch services based on selection
       # ============================================================
       - name: Start Services
         env:
           OPENCODE_SERVER_PASSWORD: ${{ env.OPENCODE_SERVER_PASSWORD }}
+          SERVICE_MODE: ${{ github.event.inputs.service_mode }}
         run: |
           # Setup Password Protection
           TTYD_ARGS=""
@@ -105,34 +115,53 @@ jobs:
             echo "Password protection disabled (OPENCODE_SERVER_PASSWORD not set)."
           fi
 
-          # Start OpenCode TTY (via ttyd)
-          echo "Starting OpenCode TTY..."
-          nohup stdbuf -oL ttyd $TTYD_ARGS -p 7681 opencode > opencode_tty.log 2>&1 &
+          echo "Service Mode: $SERVICE_MODE"
 
-          # Start OpenChamber
-          echo "Starting OpenChamber..."
-          if [[ -n "$OPENCODE_SERVER_PASSWORD" ]]; then
-            nohup stdbuf -oL openchamber --port 9090 --ui-password "$OPENCODE_SERVER_PASSWORD" > openchamber.log 2>&1 &
-          else
-            nohup stdbuf -oL openchamber --port 9090 > openchamber.log 2>&1 &
+          # ---- OpenChamber Services ----
+          if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+            # Start OpenCode TTY (via ttyd)
+            echo "Starting OpenCode TTY..."
+            nohup stdbuf -oL ttyd $TTYD_ARGS -p 7681 opencode > opencode_tty.log 2>&1 &
+
+            # Start OpenChamber
+            echo "Starting OpenChamber..."
+            if [[ -n "$OPENCODE_SERVER_PASSWORD" ]]; then
+              nohup stdbuf -oL openchamber --port 9090 --ui-password "$OPENCODE_SERVER_PASSWORD" > openchamber.log 2>&1 &
+            else
+              nohup stdbuf -oL openchamber --port 9090 > openchamber.log 2>&1 &
+            fi
           fi
 
-          # Start OpenCode Web
-          echo "Starting OpenCode Web..."
-          if [[ -n "$OPENCODE_SERVER_PASSWORD" ]]; then
-            OPENCODE_SERVER_PASSWORD="$OPENCODE_SERVER_PASSWORD" nohup stdbuf -oL opencode web --port 8080 > opencode_web.log 2>&1 &
-          else
-            nohup stdbuf -oL opencode web --port 8080 > opencode_web.log 2>&1 &
+          # ---- OpenCode Web Services ----
+          if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+            # Start OpenCode Web
+            echo "Starting OpenCode Web..."
+            if [[ -n "$OPENCODE_SERVER_PASSWORD" ]]; then
+              OPENCODE_SERVER_PASSWORD="$OPENCODE_SERVER_PASSWORD" nohup stdbuf -oL opencode web --port 8080 > opencode_web.log 2>&1 &
+            else
+              nohup stdbuf -oL opencode web --port 8080 > opencode_web.log 2>&1 &
+            fi
           fi
 
           # Wait for services to initialize
           sleep 20
           echo "Services started. Checking status..."
-          lsof -i :7681 || echo "Warning: OpenCode TTY may not be running"
-          lsof -i :9090 || echo "Warning: OpenChamber may not be running"
-          lsof -i :8080 || echo "Warning: OpenCode Web may not be running"
+
+          if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+            lsof -i :7681 || echo "Warning: OpenCode TTY may not be running"
+            lsof -i :9090 || echo "Warning: OpenChamber may not be running"
+          fi
+
+          if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+            lsof -i :8080 || echo "Warning: OpenCode Web may not be running"
+          fi
+
+          # Export service mode for tunnel setup
+          echo "SERVICE_MODE=$SERVICE_MODE" >> $GITHUB_ENV
 
       - name: Setup Pooled Tunnel
+        env:
+          SERVICE_MODE: ${{ github.event.inputs.service_mode }}
         run: |
           if [[ "${{ github.event.inputs.tunnel_provider }}" == "ngrok" ]]; then
             echo "Setting up ngrok pooled tunnels..."
@@ -140,12 +169,17 @@ jobs:
             echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
             sudo apt update && sudo apt install ngrok -y
 
-            # Create pooled ngrok config with all tunnels
+            # Create pooled ngrok config based on service mode
             mkdir -p ~/.config/ngrok
             cat > ~/.config/ngrok/ngrok.yml << EOF
           version: "2"
           authtoken: ${{ secrets.NGROK_AUTH_TOKEN }}
           tunnels:
+          EOF
+
+            # Add tunnels based on service mode
+            if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+              cat >> ~/.config/ngrok/ngrok.yml << EOF
             tty:
               addr: 7681
               proto: http
@@ -154,23 +188,35 @@ jobs:
               addr: 9090
               proto: http
               inspect: false
+          EOF
+            fi
+
+            if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+              cat >> ~/.config/ngrok/ngrok.yml << EOF
             web:
               addr: 8080
               proto: http
               inspect: false
           EOF
+            fi
 
             # Start all tunnels from single pooled config
             echo "Starting ngrok tunnel pool..."
             nohup ngrok start --all --log=stdout > tunnel_pool.log 2>&1 &
 
+            # Determine expected tunnel count
+            EXPECTED_TUNNELS=0
+            if [[ "$SERVICE_MODE" == "openchamber" ]]; then EXPECTED_TUNNELS=2; fi
+            if [[ "$SERVICE_MODE" == "opencode" ]]; then EXPECTED_TUNNELS=1; fi
+            if [[ "$SERVICE_MODE" == "both" ]]; then EXPECTED_TUNNELS=3; fi
+
             # Wait for tunnel pool to initialize
-            echo "Waiting for ngrok tunnel pool..."
+            echo "Waiting for ngrok tunnel pool ($EXPECTED_TUNNELS tunnels expected)..."
             for i in {1..30}; do
               TUNNELS_JSON=$(curl -s http://localhost:4040/api/tunnels 2>/dev/null || true)
               if [[ -n "$TUNNELS_JSON" ]]; then
                 TUNNEL_COUNT=$(echo "$TUNNELS_JSON" | jq '.tunnels | length' 2>/dev/null || echo "0")
-                if [[ "$TUNNEL_COUNT" -ge 3 ]]; then
+                if [[ "$TUNNEL_COUNT" -ge "$EXPECTED_TUNNELS" ]]; then
                   echo "All tunnels in pool established!"
                   break
                 fi
@@ -179,127 +225,93 @@ jobs:
               sleep 2
             done
 
-            # Extract URLs from pool
-            URL_TTY=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "tty") | .public_url' || true)
-            URL_CHAMBER=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "chamber") | .public_url' || true)
-            URL_WEB=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "web") | .public_url' || true)
+            # Extract URLs from pool based on service mode
+            if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+              URL_TTY=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "tty") | .public_url' || true)
+              URL_CHAMBER=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "chamber") | .public_url' || true)
+              echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
+              echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
+            fi
 
-            echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
-            echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
-            echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
+            if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+              URL_WEB=$(curl -s http://localhost:4040/api/tunnels | jq -r '.tunnels[] | select(.name == "web") | .public_url' || true)
+              echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
+            fi
 
           else
             echo "Setting up Cloudflare pooled tunnels..."
             wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
             sudo dpkg -i cloudflared-linux-amd64.deb
 
-            # Create pooled Cloudflare config with ingress rules
-            mkdir -p ~/.cloudflared
-            cat > ~/.cloudflared/config.yml << EOF
-          tunnel: openchamber-pool
-          credentials-file: ~/.cloudflared/credentials.json
-          ingress:
-            - hostname: tty.openchamber.local
-              service: http://127.0.0.1:7681
-            - hostname: chamber.openchamber.local
-              service: http://127.0.0.1:9090
-            - hostname: web.openchamber.local
-              service: http://127.0.0.1:8080
-            - service: http_status:404
-          EOF
-
-            # For quick tunnels (no account needed), start pooled processes with supervisor
-            echo "Starting Cloudflare tunnel pool..."
-            
-            # Create tunnel pool manager script
-            cat > /tmp/cf_pool_manager.sh << 'POOLSCRIPT'
-          #!/bin/bash
-          declare -A TUNNEL_PIDS
-          declare -A TUNNEL_URLS
-
-          start_tunnel() {
-            local name=$1
-            local port=$2
-            local logfile="/tmp/tunnel_${name}.log"
-            
-            cloudflared tunnel --url "http://127.0.0.1:${port}" > "$logfile" 2>&1 &
-            TUNNEL_PIDS[$name]=$!
-            echo "Started tunnel $name (PID: ${TUNNEL_PIDS[$name]})"
-          }
-
-          # Start all tunnels in pool
-          start_tunnel "tty" 7681
-          start_tunnel "chamber" 9090
-          start_tunnel "web" 8080
-
-          # Wait and collect URLs
-          echo "Collecting tunnel URLs from pool..."
-          for i in {1..30}; do
-            for name in tty chamber web; do
-              if [[ -z "${TUNNEL_URLS[$name]}" ]]; then
-                url=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' "/tmp/tunnel_${name}.log" 2>/dev/null | tail -n 1 || true)
-                if [[ -n "$url" ]]; then
-                  TUNNEL_URLS[$name]=$url
-                  echo "URL_${name^^}=$url"
-                fi
-              fi
-            done
-            
-            # Check if all URLs collected
-            if [[ -n "${TUNNEL_URLS[tty]}" && -n "${TUNNEL_URLS[chamber]}" && -n "${TUNNEL_URLS[web]}" ]]; then
-              echo "POOL_READY=true"
-              break
+            # Start tunnels based on service mode
+            if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+              echo "Starting Cloudflare tunnels for OpenChamber..."
+              nohup cloudflared tunnel --url http://127.0.0.1:7681 > tunnel_tty.log 2>&1 &
+              nohup cloudflared tunnel --url http://127.0.0.1:9090 > tunnel_chamber.log 2>&1 &
             fi
-            sleep 2
-          done
 
-          # Output final URLs
-          echo "URL_TTY=${TUNNEL_URLS[tty]}"
-          echo "URL_CHAMBER=${TUNNEL_URLS[chamber]}"
-          echo "URL_WEB=${TUNNEL_URLS[web]}"
+            if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+              echo "Starting Cloudflare tunnel for OpenCode Web..."
+              nohup cloudflared tunnel --url http://127.0.0.1:8080 > tunnel_web.log 2>&1 &
+            fi
 
-          # Keep pool alive
-          wait
-          POOLSCRIPT
-            chmod +x /tmp/cf_pool_manager.sh
+            echo "Waiting for Cloudflare Tunnel URLs..."
+            # Loop to wait for URLs
+            for i in {1..30}; do
+              if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+                URL_TTY=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel_tty.log 2>/dev/null | tail -n 1 || true)
+                URL_CHAMBER=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel_chamber.log 2>/dev/null | tail -n 1 || true)
+              fi
 
-            # Run pool manager in background and capture output
-            /tmp/cf_pool_manager.sh > /tmp/pool_output.log 2>&1 &
-            POOL_PID=$!
+              if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+                URL_WEB=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' tunnel_web.log 2>/dev/null | tail -n 1 || true)
+              fi
 
-            # Wait for pool to be ready
-            echo "Waiting for Cloudflare tunnel pool..."
-            for i in {1..60}; do
-              if grep -q "POOL_READY=true" /tmp/pool_output.log 2>/dev/null; then
-                echo "Tunnel pool is ready!"
+              # Check if required URLs are ready
+              READY=true
+              if [[ "$SERVICE_MODE" == "openchamber" ]]; then
+                [[ -z "$URL_TTY" || -z "$URL_CHAMBER" ]] && READY=false
+              elif [[ "$SERVICE_MODE" == "opencode" ]]; then
+                [[ -z "$URL_WEB" ]] && READY=false
+              elif [[ "$SERVICE_MODE" == "both" ]]; then
+                [[ -z "$URL_TTY" || -z "$URL_CHAMBER" || -z "$URL_WEB" ]] && READY=false
+              fi
+
+              if [[ "$READY" == "true" ]]; then
+                echo "All required tunnels established!"
                 break
               fi
-              echo "Waiting for pool... ($i/60)"
+              echo "Waiting for tunnels... ($i/30)"
               sleep 2
             done
 
-            # Extract URLs from pool output
-            URL_TTY=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' /tmp/tunnel_tty.log 2>/dev/null | tail -n 1 || true)
-            URL_CHAMBER=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' /tmp/tunnel_chamber.log 2>/dev/null | tail -n 1 || true)
-            URL_WEB=$(grep -o 'https://[-a-z0-9.]*trycloudflare.com' /tmp/tunnel_web.log 2>/dev/null | tail -n 1 || true)
+            # Export URLs based on service mode
+            if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+              if [[ -z "$URL_TTY" ]]; then echo "Warning: TTY Tunnel URL missing"; fi
+              if [[ -z "$URL_CHAMBER" ]]; then echo "Warning: Chamber Tunnel URL missing"; fi
+              echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
+              echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
+            fi
 
-            if [[ -z "$URL_TTY" ]]; then echo "Warning: TTY Tunnel URL missing from pool"; fi
-            if [[ -z "$URL_CHAMBER" ]]; then echo "Warning: Chamber Tunnel URL missing from pool"; fi
-            if [[ -z "$URL_WEB" ]]; then echo "Warning: Web Tunnel URL missing from pool"; fi
-
-            echo "URL_TTY=$URL_TTY" >> $GITHUB_ENV
-            echo "URL_CHAMBER=$URL_CHAMBER" >> $GITHUB_ENV
-            echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
+            if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+              if [[ -z "$URL_WEB" ]]; then echo "Warning: Web Tunnel URL missing"; fi
+              echo "URL_WEB=$URL_WEB" >> $GITHUB_ENV
+            fi
           fi
 
           # Display pool status
           echo ""
           echo "============================================"
           echo "       TUNNEL POOL STATUS"
+          echo "       Mode: $SERVICE_MODE"
           echo "============================================"
-          echo "TTY URL:     $URL_TTY"
-          echo "Chamber URL: $URL_CHAMBER"
-          echo "Web URL:     $URL_WEB"
+          if [[ "$SERVICE_MODE" == "openchamber" || "$SERVICE_MODE" == "both" ]]; then
+            echo "TTY URL:     $URL_TTY"
+            echo "Chamber URL: $URL_CHAMBER"
+          fi
+          if [[ "$SERVICE_MODE" == "opencode" || "$SERVICE_MODE" == "both" ]]; then
+            echo "Web URL:     $URL_WEB"
+          fi
           echo "============================================"
 
       # ============================================================
@@ -308,9 +320,10 @@ jobs:
       - name: Monitor & Self-Heal
         env:
           OPENCHAMBER_UI_PASSWORD: ${{ env.OPENCODE_SERVER_PASSWORD }}
+          SERVICE_MODE: ${{ github.event.inputs.service_mode }}
         run: |
           chmod +x scripts/monitor.sh
-          ./scripts/monitor.sh "${{ github.event.inputs.tunnel_provider }}" "${{ github.event.inputs.timeout_minutes }}" "${{ env.URL_TTY }}" "${{ env.URL_CHAMBER }}" "${{ env.URL_WEB }}"
+          ./scripts/monitor.sh "${{ github.event.inputs.tunnel_provider }}" "${{ github.event.inputs.timeout_minutes }}" "${{ env.URL_TTY }}" "${{ env.URL_CHAMBER }}" "${{ env.URL_WEB }}" "$SERVICE_MODE"
 
       # ============================================================
       # PERSISTENCE: Save all session data (always runs)
